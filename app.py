@@ -21,7 +21,8 @@ from src.config import (
 from src.sheets import (
     append_registration,
     get_prize_pool_stats,
-    get_recent_registrations
+    get_recent_registrations,
+    get_all_registrations
 )
 
 # Page configuration
@@ -296,6 +297,9 @@ with tab2:
     
     # Auto-refresh button
     if st.button("🔄 Refresh Now"):
+        # Clear caches to force fresh data
+        get_prize_pool_stats.clear()
+        get_all_registrations.clear()
         st.rerun()
     
     st.info(f"💡 This page automatically refreshes every {PRIZE_POOL_REFRESH_INTERVAL} seconds")

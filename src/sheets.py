@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime
 from typing import Dict, Optional
 import logging
+import time
 
 from src.config import WORKSHEET_NAME
 
@@ -18,6 +19,39 @@ logger = logging.getLogger(__name__)
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
 ]
+
+
+def retry_with_backoff(func, max_retries=5, initial_delay=1):
+    """
+    Retry a function with exponential backoff.
+    
+    Args:
+        func: Function to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds
+    
+    Returns:
+        Result of the function call
+    """
+    delay = initial_delay
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except gspread.exceptions.APIError as e:
+            if attempt == max_retries - 1:
+                raise
+            if "RESOURCE_EXHAUSTED" in str(e) or "Quota exceeded" in str(e):
+                logger.warning(f"Rate limit hit, retrying in {delay}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+                delay *= 2  # Exponential backoff
+            else:
+                raise
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            logger.warning(f"Error occurred, retrying in {delay}s (attempt {attempt + 1}/{max_retries}): {e}")
+            time.sleep(delay)
+            delay *= 2
 
 
 @st.cache_resource
@@ -43,7 +77,7 @@ def get_sheets_client():
 
 def get_worksheet():
     """Get the worksheet object for reading/writing."""
-    try:
+    def _get():
         client = get_sheets_client()
         spreadsheet_id = st.secrets["sheets"]["spreadsheet_id"]
         worksheet_name = st.secrets["sheets"].get("worksheet_name", WORKSHEET_NAME)
@@ -51,11 +85,11 @@ def get_worksheet():
         spreadsheet = client.open_by_key(spreadsheet_id)
         worksheet = spreadsheet.worksheet(worksheet_name)
         return worksheet
+    
+    try:
+        return retry_with_backoff(_get)
     except Exception as e:
         logger.error(f"Failed to access worksheet: {e}")
-        raise
-
-
 def append_registration(name: str, email: str, category: str, amount: float) -> bool:
     """
     Append a new registration row to the Google Sheet.
@@ -69,23 +103,24 @@ def append_registration(name: str, email: str, category: str, amount: float) -> 
     Returns:
         bool: True if successful, False otherwise
     """
-    try:
+    def _append():
         worksheet = get_worksheet()
         timestamp = datetime.now().isoformat()
-        
         row = [timestamp, name, email, category, amount]
         worksheet.append_row(row)
+        return True
+    
+    try:
+        result = retry_with_backoff(_append)
         
-        # Clear the cache so stats update immediately
+        # Clear all caches so stats update immediately
         get_all_registrations.clear()
+        get_prize_pool_stats.clear()
         
         logger.info(f"Successfully registered: {name} ({category}) - ${amount}")
-        return True
+        return result
     except Exception as e:
         logger.error(f"Failed to append registration: {e}")
-        return False
-
-
 @st.cache_data(ttl=60)
 def get_all_registrations() -> pd.DataFrame:
     """
@@ -95,9 +130,13 @@ def get_all_registrations() -> pd.DataFrame:
         pd.DataFrame: All registration data with columns: 
                       timestamp, name, email, category, amount
     """
-    try:
+    def _fetch():
         worksheet = get_worksheet()
         data = worksheet.get_all_values()
+        return data
+    
+    try:
+        data = retry_with_backoff(_fetch)
         
         if len(data) <= 1:  # Only header or empty
             # Return empty DataFrame with correct columns
@@ -109,6 +148,12 @@ def get_all_registrations() -> pd.DataFrame:
         # Convert amount to numeric
         df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
         
+        logger.info(f"Fetched {len(df)} registrations from sheet")
+        return df
+    except Exception as e:
+        logger.error(f"Failed to fetch registrations: {e}")
+        # Return empty DataFrame on error
+        return pd.DataFrame(columns=["timestamp", "name", "email", "category", "amount"])
         logger.info(f"Fetched {len(df)} registrations from sheet")
         return df
     except Exception as e:
